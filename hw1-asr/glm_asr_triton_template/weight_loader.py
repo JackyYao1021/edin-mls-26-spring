@@ -11,6 +11,35 @@ from typing import Dict, Optional, Union
 import torch
 
 
+def _move_model_tensors_to_device(obj, device: torch.device, seen=None) -> None:
+    """Recursively move torch.Tensor attributes to device (custom tree, not nn.Module)."""
+    if seen is None:
+        seen = set()
+    oid = id(obj)
+    if oid in seen:
+        return
+    if obj is None or isinstance(obj, (torch.Tensor, str, int, float, bool, bytes)):
+        return
+    if isinstance(obj, (list, tuple)):
+        seen.add(oid)
+        for item in obj:
+            _move_model_tensors_to_device(item, device, seen)
+        return
+    if isinstance(obj, dict):
+        seen.add(oid)
+        for v in obj.values():
+            _move_model_tensors_to_device(v, device, seen)
+        return
+    if not hasattr(obj, "__dict__"):
+        return
+    seen.add(oid)
+    for k, v in list(vars(obj).items()):
+        if isinstance(v, torch.Tensor):
+            setattr(obj, k, v.to(device))
+        else:
+            _move_model_tensors_to_device(v, device, seen)
+
+
 def create_config_from_hf(hf_config):
     """Create GlmAsrConfig from HuggingFace config."""
     from model import GlmAsrConfig
@@ -280,5 +309,9 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
     import gc
 
     gc.collect()
+
+    if torch.cuda.is_available():
+        _move_model_tensors_to_device(triton_model, torch.device("cuda"))
+        torch.cuda.empty_cache()
 
     return triton_model, processor

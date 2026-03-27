@@ -3,7 +3,7 @@ Triton Rotary Position Embeddings (RoPE)
 End-to-end implementation using Triton kernels
 
 *** STUDENT ASSIGNMENT ***
-Fill in the TODO sections to implement RoPE using Triton kernels
+RoPE cos/sin and apply_rotary_pos_emb using Triton where applicable.
 """
 
 from typing import Optional, Tuple
@@ -40,13 +40,7 @@ def compute_freqs_kernel(
     stride_sin1,
     BLOCK: tl.constexpr,
 ):
-    """
-    Compute cos and sin for rotary embeddings.
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (seq_len,)
-    """
+    """Compute cos/sin tables for rotary embeddings. Grid: (seq_len,)."""
     pid = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     mask = offs < half_dim

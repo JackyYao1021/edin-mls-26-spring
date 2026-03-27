@@ -16,10 +16,8 @@ if _dir not in sys.path:
 
 from . import layers
 
-layers.Linear.BACKEND = "cublas"
-# Fused SwiGLU / Linear+GELU kernels (see layers.py) satisfy the fusion requirement.
-layers.MLP.FUSED = True
-layers.EncoderMLP.FUSED = True
+# Runtime defaults (cublas Linear, fused MLP off) are set in layers.py for ~10GB GPUs.
+# For Triton matmul + fused MLP/Encoder: GLM_ASR_LINEAR_BACKEND=triton GLM_ASR_MLP_FUSED=1 GLM_ASR_ENCODER_MLP_FUSED=1
 
 from . import model
 from . import rope

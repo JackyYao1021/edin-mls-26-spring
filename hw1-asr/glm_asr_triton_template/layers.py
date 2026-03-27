@@ -3,10 +3,11 @@ Triton Neural Network Layers
 End-to-end implementation using Triton kernels
 
 *** STUDENT ASSIGNMENT ***
-Fill in the TODO sections to implement core layers using Triton kernels
+Core layers implemented with Triton kernels (Torch fallback where noted).
 """
 
 import math
+import os
 from typing import Optional, Tuple
 
 import numpy as np
@@ -36,6 +37,30 @@ def next_power_of_two(x: int) -> int:
     return 1 << (x - 1).bit_length() if x > 0 else 1
 
 
+def _is_cuda_oom(err: BaseException) -> bool:
+    """True for PyTorch CUDA OOM across versions (OutOfMemoryError or RuntimeError)."""
+    if err.__class__.__name__ == "OutOfMemoryError":
+        return True
+    return isinstance(err, RuntimeError) and "out of memory" in str(err).lower()
+
+
+def _cuda_oom_exception_types() -> tuple:
+    types = [RuntimeError]
+    for mod in (torch, torch.cuda):
+        t = getattr(mod, "OutOfMemoryError", None)
+        if t is not None and t not in types:
+            types.append(t)
+    return tuple(types)
+
+
+_CUDA_OOM_EXCEPTIONS = _cuda_oom_exception_types()
+
+
+def _env_truthy(key: str, default: str) -> bool:
+    """Parse GLM_ASR_* env flags: 1, true, yes, on (case-insensitive)."""
+    return os.environ.get(key, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 # ============================================================================
 # Triton Kernels
 # ============================================================================
@@ -51,13 +76,7 @@ def rmsnorm_kernel(
     eps,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    RMSNorm: x / RMS(x) * weight
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (batch_size,)
-    """
+    """RMSNorm: x / RMS(x) * weight. Grid: one program per row (batch * tokens)."""
     pid = tl.program_id(0)
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < hidden_size
@@ -83,13 +102,7 @@ def layernorm_kernel(
     eps,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    LayerNorm: (x - mean) / sqrt(var + eps) * weight + bias
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (batch_size,)
-    """
+    """LayerNorm on last dim. Grid: one program per row (batch * tokens)."""
     pid = tl.program_id(0)
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < hidden_size
@@ -108,11 +121,7 @@ def layernorm_kernel(
 
 @triton.jit
 def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    """
-    GELU using tanh approximation.
-
-    *** TODO: Implement this kernel ***
-    """
+    """GELU using tanh approximation (element-wise)."""
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
@@ -121,17 +130,13 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     sqrt_2_over_pi = 0.7978845608028654
     x3 = x * x * x
     inner = sqrt_2_over_pi * (x + 0.044715 * x3)
-    y = x * 0.5 * (1.0 + tl.libdevice.tanh(inner))
+    y = x * 0.5 * (1.0 + tl.extra.cuda.libdevice.tanh(inner))
     tl.store(y_ptr + offs, y, mask=mask)
 
 
 @triton.jit
 def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    """
-    SiLU/Swish: x * sigmoid(x)
-
-    *** TODO: Implement this kernel ***
-    """
+    """SiLU / Swish: x * sigmoid(x) (element-wise)."""
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
@@ -159,14 +164,7 @@ def linear_kernel_tf32(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    TF32-style matmul: output = A @ B.
-    A: (M, K), B: (K, N), C: (M, N)
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (M // BLOCK_M, N // BLOCK_N)
-    """
+    """Matmul C = A @ B with FP32 accum. Grid: (M // BLOCK_M, N // BLOCK_N)."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -239,7 +237,7 @@ def linear_gelu_kernel(
     sqrt_2_over_pi = 0.7978845608028654
     acc3 = acc * acc * acc
     inner = sqrt_2_over_pi * (acc + 0.044715 * acc3)
-    acc = acc * 0.5 * (1.0 + tl.libdevice.tanh(inner))
+    acc = acc * 0.5 * (1.0 + tl.extra.cuda.libdevice.tanh(inner))
 
     tl.store(
         c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
@@ -337,11 +335,7 @@ def embedding_kernel(
 
 @triton.jit
 def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.constexpr):
-    """
-    Numerically stable softmax over last dimension.
-
-    *** TODO: Implement this kernel ***
-    """
+    """Numerically stable softmax over the last dimension (one row per program)."""
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < n_cols
@@ -494,13 +488,429 @@ def causal_mask_kernel(
     )
 
 
+@triton.jit
+def attention_scores_kernel(
+    q_ptr,
+    k_ptr,
+    scores_ptr,
+    scale,
+    seq_k,
+    head_dim,
+    stride_q0,
+    stride_q1,
+    stride_q2,
+    stride_k0,
+    stride_k1,
+    stride_k2,
+    stride_s0,
+    stride_s1,
+    stride_s2,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Compute attention scores: Q @ K^T * scale."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    q = tl.load(
+        q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
+        mask=offs_d < head_dim,
+        other=0.0,
+    )
+    k = tl.load(
+        k_ptr
+        + pid_bh * stride_k0
+        + offs_k[:, None] * stride_k1
+        + offs_d[None, :] * stride_k2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+    scores = tl.sum(k * q[None, :], axis=1) * scale
+    tl.store(
+        scores_ptr
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
+        scores,
+        mask=offs_k < seq_k,
+    )
+
+
+@triton.jit
+def attention_output_kernel(
+    weights_ptr,
+    v_ptr,
+    output_ptr,
+    seq_k,
+    head_dim,
+    stride_w0,
+    stride_w1,
+    stride_w2,
+    stride_v0,
+    stride_v1,
+    stride_v2,
+    stride_o0,
+    stride_o1,
+    stride_o2,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Compute attention output: weights @ V."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    w = tl.load(
+        weights_ptr
+        + pid_bh * stride_w0
+        + pid_q * stride_w1
+        + offs_k * stride_w2,
+        mask=offs_k < seq_k,
+        other=0.0,
+    )
+    v = tl.load(
+        v_ptr
+        + pid_bh * stride_v0
+        + offs_k[:, None] * stride_v1
+        + offs_d[None, :] * stride_v2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+    out = tl.sum(v * w[:, None], axis=0)
+    tl.store(
+        output_ptr
+        + pid_bh * stride_o0
+        + pid_q * stride_o1
+        + offs_d * stride_o2,
+        out,
+        mask=offs_d < head_dim,
+    )
+
+
+@triton.jit
+def causal_mask_kernel(
+    scores_ptr,
+    seq_k,
+    offset,
+    stride_s0,
+    stride_s1,
+    stride_s2,
+    BLOCK_K: tl.constexpr,
+):
+    """Apply causal mask to attention scores."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    mask = offs_k < seq_k
+    scores = tl.load(
+        scores_ptr
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
+        mask=mask,
+        other=-1e9,
+    )
+    current_pos = pid_q + offset
+    scores = tl.where(offs_k > current_pos, -1e9, scores)
+    tl.store(
+        scores_ptr
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
+        scores,
+        mask=mask,
+    )
+
+
+@triton.jit
+def attention_scores_kernel(
+    q_ptr,
+    k_ptr,
+    scores_ptr,
+    scale,
+    seq_k,
+    head_dim,
+    stride_q0,
+    stride_q1,
+    stride_q2,
+    stride_k0,
+    stride_k1,
+    stride_k2,
+    stride_s0,
+    stride_s1,
+    stride_s2,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Compute attention scores: Q @ K^T * scale."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    q = tl.load(
+        q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
+        mask=offs_d < head_dim,
+        other=0.0,
+    )
+    k = tl.load(
+        k_ptr
+        + pid_bh * stride_k0
+        + offs_k[:, None] * stride_k1
+        + offs_d[None, :] * stride_k2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+    scores = tl.sum(k * q[None, :], axis=1) * scale
+    tl.store(
+        scores_ptr
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
+        scores,
+        mask=offs_k < seq_k,
+    )
+
+
+@triton.jit
+def attention_output_kernel(
+    weights_ptr,
+    v_ptr,
+    output_ptr,
+    seq_k,
+    head_dim,
+    stride_w0,
+    stride_w1,
+    stride_w2,
+    stride_v0,
+    stride_v1,
+    stride_v2,
+    stride_o0,
+    stride_o1,
+    stride_o2,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Compute attention output: weights @ V."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    w = tl.load(
+        weights_ptr
+        + pid_bh * stride_w0
+        + pid_q * stride_w1
+        + offs_k * stride_w2,
+        mask=offs_k < seq_k,
+        other=0.0,
+    )
+    v = tl.load(
+        v_ptr
+        + pid_bh * stride_v0
+        + offs_k[:, None] * stride_v1
+        + offs_d[None, :] * stride_v2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+    out = tl.sum(v * w[:, None], axis=0)
+    tl.store(
+        output_ptr
+        + pid_bh * stride_o0
+        + pid_q * stride_o1
+        + offs_d * stride_o2,
+        out,
+        mask=offs_d < head_dim,
+    )
+
+
+@triton.jit
+def causal_mask_kernel(
+    scores_ptr,
+    seq_k,
+    offset,
+    stride_s0,
+    stride_s1,
+    stride_s2,
+    BLOCK_K: tl.constexpr,
+):
+    """Apply causal mask to attention scores."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    mask = offs_k < seq_k
+    scores = tl.load(
+        scores_ptr
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
+        mask=mask,
+        other=-1e9,
+    )
+    current_pos = pid_q + offset
+    scores = tl.where(offs_k > current_pos, -1e9, scores)
+    tl.store(
+        scores_ptr
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
+        scores,
+        mask=mask,
+    )
+
+
+@triton.jit
+def attention_scores_kernel(
+    q_ptr,
+    k_ptr,
+    scores_ptr,
+    scale,
+    seq_k,
+    head_dim,
+    stride_q0,
+    stride_q1,
+    stride_q2,
+    stride_k0,
+    stride_k1,
+    stride_k2,
+    stride_s0,
+    stride_s1,
+    stride_s2,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Compute attention scores: Q @ K^T * scale."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    q = tl.load(
+        q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
+        mask=offs_d < head_dim,
+        other=0.0,
+    )
+    k = tl.load(
+        k_ptr
+        + pid_bh * stride_k0
+        + offs_k[:, None] * stride_k1
+        + offs_d[None, :] * stride_k2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+    scores = tl.sum(k * q[None, :], axis=1) * scale
+    tl.store(
+        scores_ptr
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
+        scores,
+        mask=offs_k < seq_k,
+    )
+
+
+@triton.jit
+def attention_output_kernel(
+    weights_ptr,
+    v_ptr,
+    output_ptr,
+    seq_k,
+    head_dim,
+    stride_w0,
+    stride_w1,
+    stride_w2,
+    stride_v0,
+    stride_v1,
+    stride_v2,
+    stride_o0,
+    stride_o1,
+    stride_o2,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Compute attention output: weights @ V."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    w = tl.load(
+        weights_ptr
+        + pid_bh * stride_w0
+        + pid_q * stride_w1
+        + offs_k * stride_w2,
+        mask=offs_k < seq_k,
+        other=0.0,
+    )
+    v = tl.load(
+        v_ptr
+        + pid_bh * stride_v0
+        + offs_k[:, None] * stride_v1
+        + offs_d[None, :] * stride_v2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+    out = tl.sum(v * w[:, None], axis=0)
+    tl.store(
+        output_ptr
+        + pid_bh * stride_o0
+        + pid_q * stride_o1
+        + offs_d * stride_o2,
+        out,
+        mask=offs_d < head_dim,
+    )
+
+
+@triton.jit
+def causal_mask_kernel(
+    scores_ptr,
+    seq_k,
+    offset,
+    stride_s0,
+    stride_s1,
+    stride_s2,
+    BLOCK_K: tl.constexpr,
+):
+    """Apply causal mask to attention scores."""
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    mask = offs_k < seq_k
+    scores = tl.load(
+        scores_ptr
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
+        mask=mask,
+        other=-1e9,
+    )
+    current_pos = pid_q + offset
+    scores = tl.where(offs_k > current_pos, -1e9, scores)
+    tl.store(
+        scores_ptr
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
+        scores,
+        mask=mask,
+    )
+
+
 # ============================================================================
 # Layer Classes
 # ============================================================================
-
-def _is_power_of_two(x: int) -> bool:
-    """Check if x is a power of two."""
-    return x > 0 and (x & (x - 1)) == 0
 
 
 class RMSNorm:
@@ -510,13 +920,12 @@ class RMSNorm:
         self.hidden_size = hidden_size
         self.eps = eps
         self.weight = torch.ones(hidden_size, dtype=torch.float32)
-        self.use_triton = _is_power_of_two(hidden_size) # This flag will force a fallback to a PyTorch implementation of the kernels when the hidden_size is not a power of 2.
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
 
-       
-        if self.use_triton and x.is_cuda:  # remove self.use_triton flag from this if-statement in case you want to always run your Triton kernel regardless of whether hidden_size is a power of 2.
+        # Triton path: BLOCK_SIZE = next_power_of_two(hidden_size), mask real width (e.g. 3584 on 4096 block).
+        if x.is_cuda:
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
             x_flat = x_flat.to(torch.float32)
@@ -554,12 +963,11 @@ class LayerNorm:
         self.eps = eps
         self.weight = torch.ones(hidden_size, dtype=torch.float32)
         self.bias = torch.zeros(hidden_size, dtype=torch.float32)
-        self.use_triton = _is_power_of_two(hidden_size)  # This flag will force a fallback to a PyTorch implementation of the kernels when the hidden_size is not a power of 2.
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
 
-        if self.use_triton and x.is_cuda:  # remove self.use_triton flag from this if-statement in case you want to always run your Triton kernel regardless of whether hidden_size is a power of 2.
+        if x.is_cuda:
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
             x_flat = x_flat.to(torch.float32)
@@ -646,7 +1054,8 @@ class Linear:
     TILE_N = 64
     TILE_K = 32
 
-    BACKEND = "torch"
+    # Default cublas: Triton matmul caches transposed/padded weights (high VRAM). Override: GLM_ASR_LINEAR_BACKEND=triton
+    BACKEND = os.environ.get("GLM_ASR_LINEAR_BACKEND", "cublas")
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         self.in_features = in_features
@@ -849,7 +1258,10 @@ def softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
 class MLP:
     """MLP with SwiGLU gating using Triton."""
 
-    FUSED = True
+    # Default off: fused path duplicates gate/up weights on GPU. Enable: GLM_ASR_MLP_FUSED=1
+    FUSED = _env_truthy("GLM_ASR_MLP_FUSED", "0")
+    # After any fused forward OOMs, skip fused path for all MLP instances (saves VRAM).
+    _fused_oom_disabled = False
     # Fused matmul tiles: same presets as Linear.TILE_* (tune together).
     TILE_M, TILE_N, TILE_K = 64, 64, 32
 
@@ -883,12 +1295,29 @@ class MLP:
         if self._gate_weight_t is None and self.use_gating:
             if self.gate_proj.weight.device != self.up_proj.weight.device:
                 self.up_proj.weight = self.up_proj.weight.to(self.gate_proj.weight.device)
-            self._gate_weight_t = self.gate_proj.weight.t().contiguous()
-            self._up_weight_t = self.up_proj.weight.t().contiguous()
+            gate_t = self.gate_proj.weight.t().contiguous()
+            up_t = self.up_proj.weight.t().contiguous()
+            self._gate_weight_t = gate_t
+            self._up_weight_t = up_t
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_gating and MLP.FUSED and x.is_cuda:
-            return self._forward_fused(x)
+        if (
+            self.use_gating
+            and MLP.FUSED
+            and x.is_cuda
+            and not MLP._fused_oom_disabled
+        ):
+            try:
+                return self._forward_fused(x)
+            except _CUDA_OOM_EXCEPTIONS as e:
+                if not _is_cuda_oom(e):
+                    raise
+                MLP._fused_oom_disabled = True
+                self._gate_weight_t = None
+                self._up_weight_t = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return self._forward_standard(x)
         return self._forward_standard(x)
 
     def _forward_standard(self, x: torch.Tensor) -> torch.Tensor:
@@ -977,7 +1406,9 @@ class MLP:
 class EncoderMLP:
     """Encoder MLP (no gating) using Triton."""
 
-    FUSED = True
+    # Default off for VRAM; enable: GLM_ASR_ENCODER_MLP_FUSED=1
+    FUSED = _env_truthy("GLM_ASR_ENCODER_MLP_FUSED", "0")
+    _fused_oom_disabled = False
     TILE_M, TILE_N, TILE_K = 64, 64, 32
 
     def __init__(
@@ -1003,8 +1434,22 @@ class EncoderMLP:
             self._fc1_weight_t = self.fc1.weight.t().contiguous()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if EncoderMLP.FUSED and self.activation == "gelu" and x.is_cuda:
-            return self._forward_fused(x)
+        if (
+            EncoderMLP.FUSED
+            and self.activation == "gelu"
+            and x.is_cuda
+            and not EncoderMLP._fused_oom_disabled
+        ):
+            try:
+                return self._forward_fused(x)
+            except _CUDA_OOM_EXCEPTIONS as e:
+                if not _is_cuda_oom(e):
+                    raise
+                EncoderMLP._fused_oom_disabled = True
+                self._fc1_weight_t = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return self._forward_standard(x)
         return self._forward_standard(x)
 
     def _forward_standard(self, x: torch.Tensor) -> torch.Tensor:

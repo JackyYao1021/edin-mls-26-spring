@@ -3,7 +3,7 @@ Triton Multi-Head Attention Implementation
 End-to-end implementation using Triton kernels
 
 *** STUDENT ASSIGNMENT ***
-Fill in the TODO sections to implement attention using Triton kernels
+Attention via Triton (FlashAttention-style path + PyTorch fallback).
 """
 
 import numpy as np
@@ -154,12 +154,7 @@ def attention_scores_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """
-    Compute scaled attention scores for a single query position.
-    Grid: (batch_heads, seq_q)
-
-    *** TODO: Implement this kernel ***
-    """
+    """Scaled Q·K^T scores for one query row. Grid: (batch_heads, seq_q)."""
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
 
